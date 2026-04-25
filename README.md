@@ -1,204 +1,236 @@
-# ⚡ Sonoff S31 Power Monitor API
+# SonoffS31 Arduino Library
 
-A lightweight **ESP8266-based REST API** for power monitoring and relay control using the Sonoff S31.
+A lightweight and reliable Arduino library for the **Sonoff S31 smart plug** using the **CSE7766 energy monitoring chip**.
 
-This firmware exposes real-time electrical measurements and device control through simple HTTP endpoints.
+Designed for **ESP8266**, this library provides real-time power monitoring, energy tracking, and relay control with a clean and simple API.
 
 ---
 
-# 🚀 Quick Start
+## ✨ Features
 
-### 1. Flash firmware
+* ⚡ Voltage measurement (V)
+* 🔌 Current measurement (A)
+* 🔥 Active power measurement (W)
+* 🔋 Energy tracking (kWh)
+* 🎛 Relay control (ON/OFF/Toggle)
+* 🔄 Real-time update loop
+* 🧠 Auto calibration (from CSE7766)
+* 🛠 Manual calibration support
+* 📡 Callback system for:
 
-Upload using PlatformIO or Arduino IDE.
+  * Power updates
+  * Relay state changes
+* 🧩 Clean and minimal implementation (no external driver required)
 
-### 2. Configure WiFi
+---
+
+## 📦 Installation
+
+### Method 1: Manual Installation
+
+1. Download this repository as ZIP
+2. Extract to:
+
+```
+Documents/Arduino/libraries/SonoffS31
+```
+
+3. Restart Arduino IDE
+
+---
+
+### Method 2: Git Clone
+
+```bash
+git clone https://github.com/komkritc/sonoff-s31-power-monitor.git
+```
+
+---
+
+## 🚀 Quick Start
+
+### Basic Example
 
 ```cpp
-const char* ssid = "YOUR_WIFI";
-const char* password = "YOUR_PASSWORD";
-```
+#include <SonoffS31.h>
 
-### 3. Access device
+SonoffS31 s31;
 
-After boot:
-
-* IP: `http://192.168.x.x`
-* mDNS: `http://s31.local`
-
----
-
-# 🌐 API Overview
-
-| Endpoint  | Method | Description              |
-| --------- | ------ | ------------------------ |
-| `/data`   | GET    | Get real-time power data |
-| `/toggle` | GET    | Toggle relay             |
-| `/info`   | GET    | Device info              |
-
----
-
-# 📊 1. Get Power Data
-
-### Request
-
-```http
-GET /data
-```
-
-### Response
-
-```json
-{
-  "voltage": 220.5,
-  "current": 0.52,
-  "power": 110.3,
-  "energy": 0.125,
-  "relayState": true
+void setup() {
+    Serial.begin(115200);
+    s31.begin();
 }
-```
 
-### Parameters
+void loop() {
+    s31.update();
 
-| Field        | Unit | Description        |
-| ------------ | ---- | ------------------ |
-| `voltage`    | V    | Line voltage       |
-| `current`    | A    | Load current       |
-| `power`      | W    | Active power       |
-| `energy`     | kWh  | Accumulated energy |
-| `relayState` | bool | ON/OFF state       |
+    Serial.print("Voltage: ");
+    Serial.println(s31.getVoltage());
 
----
+    Serial.print("Current: ");
+    Serial.println(s31.getCurrent());
 
-# 🔌 2. Toggle Relay
+    Serial.print("Power: ");
+    Serial.println(s31.getPower());
 
-### Request
+    Serial.print("Energy (kWh): ");
+    Serial.println(s31.getEnergy());
 
-```http
-GET /toggle
-```
+    Serial.println("----------------------");
 
-### Response
-
-```text
-OK
-```
-
-### Behavior
-
-* If OFF → turns ON
-* If ON → turns OFF
-
----
-
-# ℹ️ 3. Device Info
-
-### Request
-
-```http
-GET /info
-```
-
-### Response
-
-```json
-{
-  "hostname": "s31",
-  "ip": "192.168.1.100"
+    delay(1000);
 }
 ```
 
 ---
 
-# 🔁 Example Usage
+## 🔌 Relay Control
 
-## Using curl
+```cpp
+s31.setRelay(true);   // Turn ON
+s31.setRelay(false);  // Turn OFF
 
-### Get data
+s31.toggleRelay();    // Toggle state
 
-```bash
-curl http://192.168.1.100/data
-```
-
-### Toggle relay
-
-```bash
-curl http://192.168.1.100/toggle
+bool state = s31.getRelayState();
 ```
 
 ---
 
-## Using Python
+## 📊 Available Functions
 
-```python
-import requests
+| Function                  | Description                     |
+| ------------------------- | ------------------------------- |
+| `begin()`                 | Initialize device               |
+| `update()`                | Read and process CSE7766 data   |
+| `setRelay(bool)`          | Control relay                   |
+| `getRelayState()`         | Get relay state                 |
+| `toggleRelay()`           | Toggle relay                    |
+| `getVoltage()`            | Voltage (V)                     |
+| `getCurrent()`            | Current (A)                     |
+| `getPower()`              | Power (W)                       |
+| `getEnergy()`             | Energy (kWh)                    |
+| `resetEnergy()`           | Reset energy counter            |
+| `setVoltageCalibration()` | Manual voltage calibration      |
+| `setCurrentCalibration()` | Manual current calibration      |
+| `setPowerCalibration()`   | Manual power calibration        |
+| `enableAutoCalibration()` | Enable/disable auto calibration |
 
-url = "http://192.168.1.100/data"
-data = requests.get(url).json()
+---
 
-print("Power:", data["power"], "W")
-print("Energy:", data["energy"], "kWh")
+## 📡 Callbacks
+
+### Power Update Callback
+
+```cpp
+s31.onPowerUpdate([](float power, float voltage, float current) {
+    Serial.println("Power updated!");
+});
 ```
 
 ---
 
-## Using JavaScript (Frontend)
+### Relay Change Callback
 
-```javascript
-async function getData() {
-  const res = await fetch('/data');
-  const data = await res.json();
-  console.log(data);
-}
+```cpp
+s31.onRelayChange([](bool state) {
+    Serial.println(state ? "Relay ON" : "Relay OFF");
+});
 ```
 
 ---
 
-# ⏱️ Update Rate
+## ⚙️ How It Works
 
-* Sensor updates: ~10–100 ms
-* API recommended polling: **1–2 seconds**
+* The **CSE7766 chip** sends measurement data via UART (4800 baud, 8E1)
+* The library:
 
----
+  * Parses raw packets
+  * Validates checksum
+  * Applies calibration
+  * Computes:
 
-# ⚠️ Notes
-
-* No authentication (local network use recommended)
-* Energy resets on reboot (no persistent storage)
-* Accuracy depends on calibration values
-* Designed for **real-time monitoring**, not billing-grade metering
-
----
-
-# 🧠 Architecture
-
-* ESP8266 Web Server
-* UART-based CSE7766 parsing
-* Real-time energy integration
-* REST API interface
+    * Voltage
+    * Current
+    * Power
+    * Energy (integrated over time)
 
 ---
 
-# 🔧 Future API Extensions
+## ⚠️ Important Notes
 
-Planned endpoints:
+* Call `update()` **as frequently as possible** in `loop()`
+* Energy calculation depends on continuous updates
+* When relay is OFF:
 
-| Endpoint  | Description          |
-| --------- | -------------------- |
-| `/on`     | Force relay ON       |
-| `/off`    | Force relay OFF      |
-| `/reset`  | Reset energy         |
-| `/config` | Calibration settings |
-| `/mqtt`   | MQTT integration     |
+  * Power, current, and voltage reset to zero
+* Uses **hardware Serial** (default)
 
 ---
 
-# 👨‍💻 Author
+## 🧪 Calibration
 
-Komkrit Chooraung
+By default, calibration is handled automatically.
+
+You can override:
+
+```cpp
+s31.setVoltageCalibration(1912);
+s31.setCurrentCalibration(16140);
+s31.setPowerCalibration(5364);
+```
+
+Disable auto calibration:
+
+```cpp
+s31.enableAutoCalibration(false);
+```
 
 ---
 
-# 📄 License
+## 📁 Examples
+
+* `examples/basic` → simple monitoring
+* `examples/dashboard` → web-based interface (extendable)
+
+---
+
+## 🛠 Requirements
+
+* ESP8266 board (Sonoff S31)
+* Arduino IDE or PlatformIO
+
+---
+
+## 📜 License
 
 MIT License
+
+---
+
+## 👨‍💻 Author
+
+**Komkrit Chooruang**
+
+---
+
+## 🚀 Future Improvements (Planned)
+
+* Power Factor (PF)
+* Apparent Power (VA)
+* JSON API output
+* MQTT integration
+* Async Web Dashboard
+* Machine Learning anomaly detection
+
+---
+
+## ⭐ Support
+
+If you find this library useful:
+
+* ⭐ Star the repository
+* 🍴 Fork it
+* 🛠 Contribute improvements
+
+---
