@@ -1,6 +1,6 @@
 /*
  * Sonoff S31 Smart Pump Controller - Complete Configuration UI
- * Version: 2.5.0 - Non-blocking with EEPROM fixes
+ * Version: 2.5.1 - Using SonoffS31 Library
  * Features:
  * - Non-blocking operation with s31.update() priority
  * - Web UI for WiFi, MQTT, ESP-NOW configuration
@@ -22,7 +22,7 @@
 #define DEBUG false
 
 // ========== Timing Constants (Non-blocking) ==========
-#define S31_UPDATE_INTERVAL     2000    // s31.update every 100ms (priority)
+#define S31_UPDATE_INTERVAL     100     // s31.update every 100ms (priority)
 #define MQTT_RECONNECT_INTERVAL 5000    // MQTT reconnect every 5 seconds
 #define DATA_PUBLISH_INTERVAL   10000   // Publish data every 10 seconds
 #define CONTROL_INTERVAL        500     // Pump control check every 500ms
@@ -54,10 +54,9 @@ struct Config {
 
 // ========== Pin Definitions ==========
 #define RELAY_PIN 12
-#define CSE7766_RX_PIN 3
 
 // ========== Global Objects ==========
-SonoffS31 s31(CSE7766_RX_PIN, RELAY_PIN);
+SonoffS31 s31(RELAY_PIN);
 ESP8266WebServer server(80);
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
@@ -132,7 +131,7 @@ void reconnectMQTT();
 void controlPump();
 void publishData();
 
-// ========== HTML UI Pages (Same as before) ==========
+// ========== HTML UI Pages ==========
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -1004,16 +1003,15 @@ void publishData() {
   if (millis() - lastMqttPublish < DATA_PUBLISH_INTERVAL) return;
   lastMqttPublish = millis();
   
-  PowerData pd = s31.getPowerData();
   StaticJsonDocument<512> doc;
   doc["water_level"] = currentWaterLevel;
   doc["distance_cm"] = currentDistance;
   doc["volume_l"] = currentVolume;
-  doc["pump_state"] = pd.relayState;
-  doc["power_w"] = pd.power;
-  doc["voltage_v"] = pd.voltage;
-  doc["current_a"] = pd.current;
-  doc["energy_kwh"] = pd.energy;
+  doc["pump_state"] = s31.getRelayState();
+  doc["power_w"] = s31.getPower();
+  doc["voltage_v"] = s31.getVoltage();
+  doc["current_a"] = s31.getCurrent();
+  doc["energy_kwh"] = s31.getEnergy();
   doc["auto_mode"] = config.auto_mode;
   
   char buffer[512];
@@ -1027,8 +1025,7 @@ void controlPump() {
   if (millis() - lastControlCheck < CONTROL_INTERVAL) return;
   lastControlCheck = millis();
   
-  PowerData pd = s31.getPowerData();
-  bool currentState = pd.relayState;
+  bool currentState = s31.getRelayState();
   bool shouldPumpOn = false;
   
   bool dataValid = (espnow_initialized && millis() - lastEspNowData < 30000) ||
@@ -1049,6 +1046,8 @@ void controlPump() {
     pumpStats.pumpCycles++;
     pumpStats.lastPumpOnTime = millis();
     pumpStats.wasRunning = true;
+    // Update energy statistics based on power
+    pumpStats.totalEnergyKwh = s31.getEnergy();
     DEBUG_PRINTLN("Pump ON (Level: " + String(currentWaterLevel, 1) + "%)");
   } else if (!currentState && pumpStats.wasRunning) {
     unsigned long runtime = (millis() - pumpStats.lastPumpOnTime) / 1000;
@@ -1059,9 +1058,9 @@ void controlPump() {
   
   // Control pump
   if (shouldPumpOn && !currentState) {
-    s31.relayOn();
+    s31.setRelay(true);
   } else if (!shouldPumpOn && currentState) {
-    s31.relayOff();
+    s31.setRelay(false);
   }
 }
 
@@ -1073,17 +1072,15 @@ void setupWebServer() {
   });
   
   server.on("/data", HTTP_GET, []() {
-    PowerData powerData = s31.getPowerData();
-    
     StaticJsonDocument<768> doc;
     doc["waterLevel"] = currentWaterLevel;
     doc["distance"] = currentDistance;
     doc["volume"] = currentVolume;
-    doc["power"] = powerData.power;
-    doc["voltage"] = powerData.voltage;
-    doc["current"] = powerData.current;
-    doc["energy"] = powerData.energy;
-    doc["pumpState"] = powerData.relayState;
+    doc["power"] = s31.getPower();
+    doc["voltage"] = s31.getVoltage();
+    doc["current"] = s31.getCurrent();
+    doc["energy"] = s31.getEnergy();
+    doc["pumpState"] = s31.getRelayState();
     doc["autoMode"] = config.auto_mode;
     doc["mqttConnected"] = mqtt.connected();
     doc["espnowActive"] = espnow_initialized;
@@ -1094,7 +1091,7 @@ void setupWebServer() {
     
     String reason = "";
     if (!config.auto_mode) reason = "Manual Control";
-    else if (powerData.relayState) reason = "Water level low (" + String(currentWaterLevel, 1) + "%)";
+    else if (s31.getRelayState()) reason = "Water level low (" + String(currentWaterLevel, 1) + "%)";
     else if (currentWaterLevel >= config.high_threshold) reason = "Tank full";
     else reason = "Level OK";
     doc["pumpReason"] = reason;
@@ -1186,13 +1183,13 @@ void setupWebServer() {
     if (server.hasArg("mode")) {
       config.auto_mode = (server.arg("mode") == "auto");
       saveConfig();
-      if (!config.auto_mode) s31.relayOff();
+      if (!config.auto_mode) s31.setRelay(false);
     }
     server.send(200, "text/plain", "OK");
   });
   
   server.on("/toggle", HTTP_GET, []() {
-    if (!config.auto_mode) s31.relayToggle();
+    if (!config.auto_mode) s31.toggleRelay();
     server.send(200, "text/plain", "OK");
   });
   
@@ -1312,7 +1309,7 @@ void setup() {
   #if DEBUG
     Serial.begin(115200);
     delay(100);
-    DEBUG_PRINTLN("\n=== Smart Pump Controller v2.5.0 ===");
+    DEBUG_PRINTLN("\n=== Smart Pump Controller v2.5.1 ===");
   #endif
   
   // Initialize EEPROM and load config
@@ -1327,13 +1324,8 @@ void setup() {
   deviceName = "s31-pump-" + String(chipId & 0xFFFF, HEX);
   apSSID = "SmartPump-" + String(chipId & 0xFFFF, HEX);
   
-  #if !DEBUG
-    s31.begin(4800);
-    s31.update();
-  #else
-    pinMode(RELAY_PIN, OUTPUT);
-    digitalWrite(RELAY_PIN, LOW);
-  #endif
+  // Initialize SonoffS31 library
+  s31.begin();
   
   // Connect to WiFi or start AP
   if (strlen(config.ssid) > 0) {
@@ -1364,7 +1356,6 @@ void setup() {
   
   DEBUG_PRINTLN("Setup complete - " + deviceName);
   DEBUG_PRINTLN("===============================\n");
-  s31.update();
 }
 
 // ========== Non-blocking Main Loop ==========
@@ -1374,9 +1365,7 @@ void loop() {
   // HIGHEST PRIORITY: s31.update() - Run every 100ms
   if (currentMillis - lastS31Update >= S31_UPDATE_INTERVAL) {
     lastS31Update = currentMillis;
-    #if !DEBUG
-      s31.update();
-    #endif
+    s31.update();
   }
   
   // Run other tasks with time limits to ensure s31.update priority
