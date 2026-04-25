@@ -14,9 +14,13 @@ const int relayPin = 12;
 #define CSE_HEADER1 0x55
 #define CSE_HEADER2 0x5A
 #define CSE_PACKET_LEN 24
+#define CSE_MAX_INVALID_POWER 20     // Reduced from 128 to 20 (about 2-3 seconds)
+#define CSE_PREF 1000
+#define CSE_UREF 100
 
 uint8_t rx_buffer[25];
 int byte_counter = 0;
+bool receive_flag = false;
 
 // Power measurements
 float voltage = 0.0;
@@ -26,6 +30,15 @@ float energy = 0.0;
 float accumulated_energy = 0.0;
 float last_power = 0.0;
 unsigned long last_energy_calc = 0;
+unsigned long last_power_time = 0;
+
+// CSE7766 specific variables
+long voltage_cycle = 0;
+long current_cycle = 0;
+long power_cycle = 0;
+long power_cycle_first = 0;
+uint8_t power_invalid_count = 0;
+bool load_detected = false;
 
 // Calibration values
 long voltage_cal = 1912;
@@ -272,8 +285,8 @@ const char index_html[] PROGMEM = R"rawliteral(
                 
                 document.getElementById('power').innerText = data.power.toFixed(1);
                 document.getElementById('voltage').innerText = data.voltage.toFixed(1);
-                document.getElementById('current').innerText = data.current.toFixed(2);
-                document.getElementById('energy').innerText = data.energy.toFixed(2);
+                document.getElementById('current').innerText = data.current.toFixed(3);
+                document.getElementById('energy').innerText = data.energy.toFixed(3);
                 
                 const relayStatus = document.getElementById('relayStatus');
                 const relayBtn = document.getElementById('relayBtn');
@@ -317,7 +330,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             } catch(e) {}
         }
         
-        setInterval(fetchData, 1500);
+        setInterval(fetchData, 1000);
         setInterval(getDeviceInfo, 30000);
         
         fetchData();
@@ -328,109 +341,179 @@ const char index_html[] PROGMEM = R"rawliteral(
 )rawliteral";
 
 // CSE7766 Functions
-void cseProcessByte(uint8_t b) {
-  rx_buffer[byte_counter++] = b;
-
-  if (byte_counter == CSE_PACKET_LEN) {
-    uint8_t checksum = 0;
-    for (int i = 2; i < (CSE_PACKET_LEN - 1); i++) checksum += rx_buffer[i];
-
-    if (checksum == rx_buffer[CSE_PACKET_LEN - 1]) {
-      // Parse packet
-      uint8_t header = rx_buffer[0];
-      uint8_t adj = rx_buffer[20];
-
-      // Update calibration
-      if (header != 0xAA) {
-        long new_voltage_cal = ((rx_buffer[2] << 16) | (rx_buffer[3] << 8) | rx_buffer[4]) / 100;
-        long new_current_cal = (rx_buffer[8] << 16) | (rx_buffer[9] << 8) | rx_buffer[10];
-        long new_power_cal = ((rx_buffer[14] << 16) | (rx_buffer[15] << 8) | rx_buffer[16]) / 1000;
-
-        if (new_voltage_cal > 0) voltage_cal = new_voltage_cal;
-        if (new_current_cal > 0) current_cal = new_current_cal;
-        if (new_power_cal > 0) power_cal = new_power_cal;
+void CseReceived() {
+  uint8_t header = rx_buffer[0];
+  
+  if ((header & 0xFC) == 0xFC) {
+    return;
+  }
+  
+  // Get calibration data from chip if not set
+  if (voltage_cal == 1912 && header != 0xAA) {
+    long voltage_coefficient = (rx_buffer[2] << 16) | (rx_buffer[3] << 8) | rx_buffer[4];
+    voltage_cal = voltage_coefficient / CSE_UREF;
+  }
+  
+  if (current_cal == 16140 && header != 0xAA) {
+    long current_coefficient = (rx_buffer[8] << 16) | (rx_buffer[9] << 8) | rx_buffer[10];
+    current_cal = current_coefficient;
+  }
+  
+  if (power_cal == 5364 && header != 0xAA) {
+    long power_coefficient = (rx_buffer[14] << 16) | (rx_buffer[15] << 8) | rx_buffer[16];
+    power_cal = power_coefficient / CSE_PREF;
+  }
+  
+  uint8_t adjustment = rx_buffer[20];
+  voltage_cycle = (rx_buffer[5] << 16) | (rx_buffer[6] << 8) | rx_buffer[7];
+  current_cycle = (rx_buffer[11] << 16) | (rx_buffer[12] << 8) | rx_buffer[13];
+  power_cycle = (rx_buffer[17] << 16) | (rx_buffer[18] << 8) | rx_buffer[19];
+  
+  if (relayState) {
+    // Update voltage (always)
+    if ((adjustment & 0x40) && voltage_cycle > 0) {
+      float newVoltage = (float)(voltage_cal * CSE_UREF) / (float)voltage_cycle;
+      if (newVoltage > 50 && newVoltage < 300) {
+        voltage = newVoltage;
       }
-
-      // Calculate values
-      long voltage_cycle = (rx_buffer[5] << 16) | (rx_buffer[6] << 8) | rx_buffer[7];
-      long current_cycle = (rx_buffer[11] << 16) | (rx_buffer[12] << 8) | rx_buffer[13];
-      long power_cycle = (rx_buffer[17] << 16) | (rx_buffer[18] << 8) | rx_buffer[19];
-
-      if ((adj & 0x40) && voltage_cycle > 0) {
-        float newVoltage = (voltage_cal * 100.0) / voltage_cycle;
-        if (newVoltage > 50 && newVoltage < 300) voltage = newVoltage;
+    }
+    
+    // Update power with fast timeout
+    if (adjustment & 0x10) {
+      // Valid power reading
+      power_invalid_count = 0;
+      last_power_time = millis();
+      
+      if ((header & 0xF2) == 0xF2) {
+        power = 0;
+      } else {
+        if (power_cycle_first == 0) {
+          power_cycle_first = power_cycle;
+        }
+        if (power_cycle_first != power_cycle) {
+          power_cycle_first = -1;
+          float newPower = (float)(power_cal * CSE_PREF) / (float)power_cycle;
+          if (newPower >= 0 && newPower < 5000) {
+            // Only update if power > 0.5W or if we already have load
+            if (newPower > 0.5 || power > 0) {
+              power = newPower;
+            }
+          }
+        }
       }
-
-      if ((adj & 0x10) && power_cycle > 0 && (header & 0xF2) != 0xF2) {
-        float newPower = (power_cal * 1000.0) / power_cycle;
-        if (newPower >= 0 && newPower < 5000) power = newPower;
+    } else {
+      // Invalid power reading
+      if (power_invalid_count < CSE_MAX_INVALID_POWER) {
+        power_invalid_count++;
       }
-
-      if ((adj & 0x20) && current_cycle > 0 && power > 0.1) {
-        float newCurrent = current_cal / (float)current_cycle;
-        if (newCurrent >= 0 && newCurrent < 20) current = newCurrent;
+      
+      // Also check timeout (2 seconds without valid reading)
+      if (power_invalid_count >= CSE_MAX_INVALID_POWER || 
+          (last_power_time > 0 && millis() - last_power_time > 2000)) {
+        power_cycle_first = 0;
+        power = 0;
+        current = 0;
       }
-
-      // Calculate energy
-      unsigned long now = millis();
-      if (last_energy_calc > 0 && last_power > 0) {
-        float hours_elapsed = (now - last_energy_calc) / 3600000.0;
+    }
+    
+    // Update current
+    if ((adjustment & 0x20) && current_cycle > 0 && power > 0.1) {
+      float newCurrent = (float)current_cal / (float)current_cycle;
+      if (newCurrent >= 0 && newCurrent < 20) {
+        current = newCurrent;
+      }
+    } else if (power < 0.5) {
+      current = 0;
+    }
+    
+    // Energy calculation
+    unsigned long now = millis();
+    if (last_energy_calc > 0 && power > 0.5) {
+      float hours_elapsed = (now - last_energy_calc) / 3600000.0;
+      if (hours_elapsed > 0 && hours_elapsed < 1.0) {
         float avg_power = (power + last_power) / 2.0;
         accumulated_energy += (avg_power / 1000.0) * hours_elapsed;
         energy = accumulated_energy;
       }
-      last_power = power;
-      last_energy_calc = now;
     }
-    byte_counter = 0;
-  }
-
-  // Byte alignment
-  if (byte_counter == 1 && rx_buffer[0] != CSE_HEADER1) byte_counter = 0;
-  if (byte_counter == 2 && rx_buffer[1] != CSE_HEADER2) {
-    rx_buffer[0] = rx_buffer[1];
-    byte_counter = (rx_buffer[0] == CSE_HEADER1) ? 1 : 0;
+    last_power = power;
+    last_energy_calc = now;
+    
+  } else {
+    // Relay is OFF
+    power_cycle_first = 0;
+    power_invalid_count = 0;
+    power = 0;
+    current = 0;
+    voltage = 0;
   }
 }
 
-void setup() {
-  // Initialize Serial for CSE7766
-  Serial.begin(4800, SERIAL_8E1);
+bool CseSerialInput(uint8_t byte) {
+  if (receive_flag) {
+    rx_buffer[byte_counter++] = byte;
+    if (CSE_PACKET_LEN == byte_counter) {
+      uint8_t checksum = 0;
+      for (uint8_t i = 2; i < 23; i++) { 
+        checksum += rx_buffer[i]; 
+      }
+      
+      if (checksum == rx_buffer[23]) {
+        CseReceived();
+        receive_flag = false;
+        return true;
+      } else {
+        // Try to re-sync
+        for (int i = 1; i < byte_counter; i++) {
+          if (rx_buffer[i] == 0x5A) {
+            memmove(rx_buffer, rx_buffer + i, byte_counter - i);
+            byte_counter -= i;
+            receive_flag = true;
+            return false;
+          }
+        }
+        receive_flag = false;
+        byte_counter = 0;
+      }
+    }
+  } else {
+    if ((0x5A == byte) && (1 == byte_counter)) {
+      receive_flag = true;
+    } else {
+      byte_counter = 0;
+    }
+    rx_buffer[byte_counter++] = byte;
+  }
+  return false;
+}
 
-  // Setup relay
+void setup() {
+  Serial.begin(4800, SERIAL_8E1);
+  
   pinMode(relayPin, OUTPUT);
   digitalWrite(relayPin, LOW);
-
-  // Generate unique hostname
-  //   uint32_t chipId = ESP.getChipId();
-  //   deviceName = "s31-" + String(chipId & 0xFFFF, HEX);
-  //   deviceName.toLowerCase();
-
+  
   deviceName = "s31";
-
-  // Connect to WiFi
+  
   WiFi.hostname(deviceName);
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-
+  
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
   }
-
-  // Setup mDNS
+  
   MDNS.begin(deviceName.c_str());
   MDNS.addService("http", "tcp", 80);
-
-  // Setup OTA
+  
   ArduinoOTA.setHostname(deviceName.c_str());
   ArduinoOTA.setPassword("admin123");
   ArduinoOTA.begin();
-
-  // Web server routes
+  
   server.on("/", HTTP_GET, []() {
     server.send_P(200, "text/html", index_html);
   });
-
+  
   server.on("/data", HTTP_GET, []() {
     String json = "{";
     json += "\"voltage\":" + String(voltage, 1) + ",";
@@ -441,13 +524,20 @@ void setup() {
     json += "}";
     server.send(200, "application/json", json);
   });
-
+  
   server.on("/toggle", HTTP_GET, []() {
     relayState = !relayState;
     digitalWrite(relayPin, relayState ? HIGH : LOW);
+    if (!relayState) {
+      power = 0;
+      current = 0;
+      voltage = 0;
+      power_cycle_first = 0;
+      power_invalid_count = 0;
+    }
     server.send(200, "text/plain", "OK");
   });
-
+  
   server.on("/info", HTTP_GET, []() {
     String json = "{";
     json += "\"hostname\":\"" + deviceName + "\",";
@@ -455,25 +545,31 @@ void setup() {
     json += "}";
     server.send(200, "application/json", json);
   });
-
+  
+  server.on("/reset", HTTP_GET, []() {
+    accumulated_energy = 0;
+    energy = 0;
+    server.send(200, "text/plain", "Energy reset");
+  });
+  
   server.begin();
-
+  
   last_energy_calc = millis();
+  last_power_time = millis();
+  power_invalid_count = 0;
 }
 
 void loop() {
-  // Read CSE7766 data
   while (Serial.available()) {
     int rb = Serial.read();
     if (rb != -1) {
-      cseProcessByte((uint8_t)rb);
+      CseSerialInput((uint8_t)rb);
     }
   }
-
-  // Handle OTA and web server
+  
   ArduinoOTA.handle();
   MDNS.update();
   server.handleClient();
-
-  delay(10);
+  
+  delay(5);
 }
