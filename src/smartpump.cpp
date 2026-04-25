@@ -1,12 +1,18 @@
 /*
  * Sonoff S31 Smart Pump Controller - Complete Configuration UI
- * Version: 2.5.1 - Using SonoffS31 Library
+ * Version: 2.8.0 - MQTT Subscribe with Test Publisher & Payload Display
  * Features:
- * - Non-blocking operation with s31.update() priority
- * - Web UI for WiFi, MQTT, ESP-NOW configuration
+ * - MQTT Subscribe only with test message publisher
+ * - Display full incoming MQTT payload in web UI
+ * - Parse TankMonitor888/status payload format
+ * - AP mode with 10-minute timeout and auto-reboot
  * - Real-time pump control with water level monitoring
- * - Fixed EEPROM save/load with validation
  */
+
+// ========== MQTT Buffer Configuration ==========
+// Place at top of file before ANY includes
+#define MQTT_MAX_PACKET_SIZE 2048
+#define MQTT_KEEPALIVE 30
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
@@ -24,21 +30,23 @@
 // ========== Timing Constants (Non-blocking) ==========
 #define S31_UPDATE_INTERVAL     100     // s31.update every 100ms (priority)
 #define MQTT_RECONNECT_INTERVAL 5000    // MQTT reconnect every 5 seconds
-#define DATA_PUBLISH_INTERVAL   10000   // Publish data every 10 seconds
 #define CONTROL_INTERVAL        500     // Pump control check every 500ms
 #define WEB_SERVER_INTERVAL     10      // Web server handle every 10ms
 #define OTA_INTERVAL            50      // OTA handle every 50ms
 #define MDNS_INTERVAL           1000    // MDNS update every second
 #define AQUIRE_TIMEOUT          100     // Max time per loop iteration
+#define AP_MODE_TIMEOUT         600000  // AP Mode timeout: 10 minutes (600,000 ms)
+#define MAX_WIFI_ATTEMPTS       20      // Maximum WiFi connection attempts (10 seconds)
 
 // ========== Configuration Structure with Magic Number ==========
 struct Config {
-  uint32_t magic = 0xDEADBEEF;  // Magic number to validate saved data
+  uint32_t magic = 0xDEADBEEF;
   char ssid[32] = "";
   char password[32] = "";
   char mqtt_server[40] = "broker.hivemq.com";
   int mqtt_port = 1883;
-  char mqtt_topic[64] = "TankMonitor144/status";
+  char mqtt_topic[64] = "TankMonitor888/status";
+  char mqtt_publish_topic[64] = "TankMonitor888/command";  // New: topic for sending test messages
   float low_threshold = 30.0;
   float high_threshold = 80.0;
   bool auto_mode = true;
@@ -65,24 +73,35 @@ PubSubClient mqtt(espClient);
 String deviceName = "s31-pump";
 String apSSID = "";
 bool apMode = false;
+unsigned long apModeStartTime = 0;
 
-// Timing variables for non-blocking operations
+// Timing variables
 unsigned long lastS31Update = 0;
 unsigned long lastMqttAttempt = 0;
-unsigned long lastMqttPublish = 0;
 unsigned long lastControlCheck = 0;
 unsigned long lastWebServer = 0;
 unsigned long lastOTA = 0;
 unsigned long lastMDNS = 0;
-unsigned long pumpStartTime = 0;
 
-// Sensor data
+// Sensor data from MQTT
 float currentWaterLevel = 0;
 float currentDistance = 0;
 float currentVolume = 0;
-String waterSource = "TankMonitor";
+float batteryVoltage = 0;
+float batteryPercentage = 0;
+String batteryStatus = "Unknown";
+String sensorDeviceId = "";
+String sensorIpAddress = "";
+String sensorTimestamp = "";
+String sensorNextSleep = "";
+String sensorNextOnline = "";
+String sensorUptime = "";
 unsigned long lastMqttData = 0;
 bool mqttDataValid = false;
+
+// Store last received MQTT payload for display
+String lastMqttPayload = "";
+String lastMqttTopic = "";
 
 // ESP-NOW Variables
 bool espnow_initialized = false;
@@ -122,14 +141,17 @@ void saveConfig();
 void loadConfig();
 bool isConfigValid();
 void factoryReset();
-void dumpEEPROM();
 String macToString(const uint8_t* mac);
 bool stringToMac(const String& macStr, uint8_t* mac);
 void initEspNow();
 void setupWebServer();
 void reconnectMQTT();
 void controlPump();
-void publishData();
+bool connectToWiFi();
+void setupAPMode();
+void checkAPModeTimeout();
+void rebootDevice();
+void publishTestMessage(String topic, String message);
 
 // ========== HTML UI Pages ==========
 const char index_html[] PROGMEM = R"rawliteral(
@@ -148,7 +170,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             padding: 20px;
         }
         .container {
-            max-width: 800px;
+            max-width: 900px;
             margin: 0 auto;
         }
         .card {
@@ -171,6 +193,16 @@ const char index_html[] PROGMEM = R"rawliteral(
             margin-bottom: 20px;
             padding-bottom: 10px;
             border-bottom: 1px solid #eee;
+        }
+        .warning-banner {
+            background: #FEF3C7;
+            color: #92400E;
+            padding: 10px;
+            border-radius: 10px;
+            margin-bottom: 15px;
+            text-align: center;
+            font-size: 12px;
+            border-left: 4px solid #F59E0B;
         }
         .nav-buttons {
             display: flex;
@@ -295,12 +327,16 @@ const char index_html[] PROGMEM = R"rawliteral(
             margin-bottom: 5px;
             color: #333;
         }
-        input, select {
+        input, select, textarea {
             width: 100%;
             padding: 10px;
             border: 1px solid #ddd;
             border-radius: 8px;
             font-size: 14px;
+        }
+        textarea {
+            font-family: monospace;
+            resize: vertical;
         }
         button {
             background: #667eea;
@@ -317,6 +353,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         button.danger { background: #EF4444; }
         button.danger:hover { background: #dc2626; }
         button.success { background: #10B981; }
+        button.warning { background: #F59E0B; }
         .info-text {
             font-size: 11px;
             color: #666;
@@ -331,6 +368,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         }
         .status-online { background: #10B981; animation: pulse 2s infinite; }
         .status-offline { background: #EF4444; }
+        .status-warning { background: #F59E0B; }
         .mac-address {
             font-family: monospace;
             font-size: 14px;
@@ -339,33 +377,60 @@ const char index_html[] PROGMEM = R"rawliteral(
             border-radius: 5px;
             text-align: center;
         }
-        .peer-list {
-            max-height: 200px;
-            overflow-y: auto;
-            border: 1px solid #ddd;
+        .sensor-info {
+            background: #f0fdf4;
+            border-left: 4px solid #10B981;
+            padding: 10px;
             border-radius: 8px;
-            padding: 10px;
+            margin-top: 10px;
+            font-size: 11px;
         }
-        .peer-item {
-            background: white;
+        .mqtt-payload {
+            background: #1e1e1e;
+            color: #d4d4d4;
             padding: 10px;
-            margin-bottom: 5px;
-            border-radius: 5px;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 11px;
+            overflow-x: auto;
+            margin-top: 10px;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .test-mqtt-box {
+            background: #f0f0f0;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 15px;
+        }
+        .inline-input {
             display: flex;
-            justify-content: space-between;
-            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        .inline-input input {
+            flex: 2;
+        }
+        .inline-input button {
+            flex: 0;
+            margin-top: 0;
         }
         @media (max-width: 600px) {
             .stats-grid { grid-template-columns: 1fr; }
             .nav-buttons { flex-direction: column; }
+            .inline-input { flex-direction: column; }
         }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="card">
-            <h1>💧 Smart Pump Controller v1.01</h1>
+            <h1>💧 Smart Pump Controller v1.04</h1>
             <div class="subtitle" id="deviceInfo">Loading...</div>
+            
+            <div id="apWarning" class="warning-banner" style="display:none;">
+                ⚠️ AP MODE ACTIVE - Device will reboot in <span id="apCountdown">10:00</span> to search for WiFi
+            </div>
             
             <div class="nav-buttons">
                 <button class="nav-btn active" onclick="showSection('dashboard')">Dashboard</button>
@@ -406,11 +471,22 @@ const char index_html[] PROGMEM = R"rawliteral(
                 
                 <div class="config-section">
                     <div class="config-group">
+                        <div><span class="status-led" id="wifiLed"></span> WiFi: <span id="wifiStatus">Disconnected</span></div>
                         <div><span class="status-led" id="mqttLed"></span> MQTT: <span id="mqttStatus">Disconnected</span></div>
                         <div><span class="status-led" id="espnowLed"></span> ESP-NOW: <span id="espnowStatus">Disabled</span></div>
                         <div>Data Source: <span id="dataSource">-</span></div>
                         <div id="lastUpdate" style="margin-top: 10px; font-size: 11px; color: #666;"></div>
                     </div>
+                </div>
+                
+                <!-- Sensor Information Section -->
+                <div class="sensor-info" id="sensorInfo" style="display:none;">
+                    <strong>📡 Water Level Sensor:</strong><br>
+                    Device: <span id="sensorDevice">-</span><br>
+                    IP: <span id="sensorIP">-</span><br>
+                    Battery: <span id="sensorBattery">-</span>% (<span id="sensorBatteryStatus">-</span>)<br>
+                    Last Reading: <span id="sensorTimestamp">-</span><br>
+                    Next Online: <span id="sensorNextOnline">-</span>
                 </div>
             </div>
             
@@ -434,12 +510,13 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <button onclick="saveWiFi()">Save & Restart</button>
                 <button class="danger" onclick="resetWiFi()">Reset WiFi Settings</button>
                 <button class="danger" onclick="factoryReset()">Factory Reset All</button>
+                <button class="warning" onclick="rebootNow()">Reboot Device</button>
                 <div id="wifiScanResult" class="peer-list" style="margin-top: 10px;"></div>
             </div>
             
-            <!-- MQTT Configuration Section -->
+            <!-- MQTT Configuration Section with Test Publisher -->
             <div id="mqttSection" style="display:none;">
-                <h3>MQTT Configuration</h3>
+                <h3>MQTT Configuration (Subscribe Only)</h3>
                 <div class="config-group">
                     <label>MQTT Broker</label>
                     <input type="text" id="mqttServer" placeholder="broker.hivemq.com">
@@ -449,11 +526,40 @@ const char index_html[] PROGMEM = R"rawliteral(
                     <input type="number" id="mqttPort" placeholder="1883">
                 </div>
                 <div class="config-group">
-                    <label>MQTT Topic</label>
-                    <input type="text" id="mqttTopic" placeholder="TankMonitor144/status">
+                    <label>MQTT Subscribe Topic</label>
+                    <input type="text" id="mqttTopic" placeholder="TankMonitor888/status">
+                    <div class="info-text">Device subscribes to this topic for water level data</div>
+                </div>
+                <div class="config-group">
+                    <label>MQTT Publish Topic (for testing)</label>
+                    <input type="text" id="mqttPublishTopic" placeholder="TankMonitor888/command">
+                    <div class="info-text">Topic used when sending test messages</div>
                 </div>
                 <button onclick="saveMQTT()">Save MQTT Settings</button>
                 <button onclick="testMQTT()">Test Connection</button>
+                
+                <!-- Test Message Sender -->
+                <div class="test-mqtt-box">
+                    <h4>📤 Send Test MQTT Message</h4>
+                    <div class="inline-input">
+                        <input type="text" id="testTopic" placeholder="Topic (leave empty to use publish topic)">
+                        <button onclick="sendTestMessage()">Send</button>
+                    </div>
+                    <textarea id="testMessage" rows="4" placeholder='Enter JSON message, e.g.:
+{"level_percent":45.2,"distance_cm":25.5,"volume_liters":1250,"battery_percentage":85}'>{"level_percent":45.2,"distance_cm":25.5,"volume_liters":1250,"battery_percentage":85,"battery_status":"Good"}</textarea>
+                    <div class="info-text">Send a test message via MQTT (device must be connected to broker)</div>
+                </div>
+                
+                <!-- Incoming Payload Display -->
+                <div style="margin-top: 20px;">
+                    <h4>📥 Last Received MQTT Message</h4>
+                    <div class="config-group">
+                        <label>Topic: <span id="lastMqttTopic" style="color:#667eea;">-</span></label>
+                        <div class="mqtt-payload" id="lastMqttPayload">No messages received yet</div>
+                    </div>
+                    <button onclick="clearPayloadDisplay()">Clear Display</button>
+                </div>
+                
                 <div id="mqttTestResult" class="info-text" style="margin-top: 10px;"></div>
             </div>
             
@@ -527,6 +633,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     
     <script>
         let currentSection = 'dashboard';
+        let apModeActive = false;
         
         function showSection(section) {
             currentSection = section;
@@ -554,7 +661,8 @@ const char index_html[] PROGMEM = R"rawliteral(
             const config = await fetchConfig();
             document.getElementById('mqttServer').value = config.mqtt_server || 'broker.hivemq.com';
             document.getElementById('mqttPort').value = config.mqtt_port || 1883;
-            document.getElementById('mqttTopic').value = config.mqtt_topic || 'TankMonitor144/status';
+            document.getElementById('mqttTopic').value = config.mqtt_topic || 'TankMonitor888/status';
+            document.getElementById('mqttPublishTopic').value = config.mqtt_publish_topic || 'TankMonitor888/command';
         }
         
         async function loadEspNowSettings() {
@@ -615,6 +723,8 @@ const char index_html[] PROGMEM = R"rawliteral(
                     document.getElementById('manualBtn').className = 'mode-btn active';
                 }
                 
+                document.getElementById('wifiStatus').innerHTML = data.wifiConnected ? 'Connected' : 'Disconnected';
+                document.getElementById('wifiLed').className = 'status-led ' + (data.wifiConnected ? 'status-online' : 'status-offline');
                 document.getElementById('mqttStatus').innerHTML = data.mqttConnected ? 'Connected' : 'Disconnected';
                 document.getElementById('mqttLed').className = 'status-led ' + (data.mqttConnected ? 'status-online' : 'status-offline');
                 document.getElementById('espnowStatus').innerHTML = data.espnowActive ? 'Active' : 'Disabled';
@@ -622,6 +732,41 @@ const char index_html[] PROGMEM = R"rawliteral(
                 document.getElementById('dataSource').innerHTML = data.dataSource || 'MQTT';
                 document.getElementById('lastUpdate').innerHTML = 'Updated: ' + new Date().toLocaleTimeString();
                 document.getElementById('deviceInfo').innerHTML = data.hostname + ' | ' + data.ip;
+                
+                // Update MQTT payload display if on MQTT section
+                if (currentSection === 'mqtt' && data.lastMqttPayload) {
+                    document.getElementById('lastMqttTopic').innerHTML = data.lastMqttTopic || '-';
+                    document.getElementById('lastMqttPayload').innerHTML = data.lastMqttPayload;
+                }
+                
+                // Show sensor info if available
+                if (data.sensorInfo && data.sensorInfo.available) {
+                    document.getElementById('sensorInfo').style.display = 'block';
+                    document.getElementById('sensorDevice').innerHTML = data.sensorInfo.device || '-';
+                    document.getElementById('sensorIP').innerHTML = data.sensorInfo.ip || '-';
+                    document.getElementById('sensorBattery').innerHTML = data.sensorInfo.battery_percentage || '-';
+                    document.getElementById('sensorBatteryStatus').innerHTML = data.sensorInfo.battery_status || '-';
+                    document.getElementById('sensorTimestamp').innerHTML = data.sensorInfo.timestamp || '-';
+                    document.getElementById('sensorNextOnline').innerHTML = data.sensorInfo.next_online || '-';
+                } else {
+                    document.getElementById('sensorInfo').style.display = 'none';
+                }
+                
+                // Show AP mode warning
+                if (data.apModeActive) {
+                    document.getElementById('apWarning').style.display = 'block';
+                    apModeActive = true;
+                } else {
+                    document.getElementById('apWarning').style.display = 'none';
+                    apModeActive = false;
+                }
+                
+                // Update countdown if in AP mode
+                if (apModeActive && data.apTimeRemaining) {
+                    const minutes = Math.floor(data.apTimeRemaining / 60);
+                    const seconds = data.apTimeRemaining % 60;
+                    document.getElementById('apCountdown').innerText = `${minutes.toString().padStart(2,'0')}:${seconds.toString().padStart(2,'0')}`;
+                }
                 
             } catch(e) { console.error('Fetch error:', e); }
         }
@@ -661,7 +806,8 @@ const char index_html[] PROGMEM = R"rawliteral(
             const settings = {
                 mqtt_server: document.getElementById('mqttServer').value,
                 mqtt_port: parseInt(document.getElementById('mqttPort').value),
-                mqtt_topic: document.getElementById('mqttTopic').value
+                mqtt_topic: document.getElementById('mqttTopic').value,
+                mqtt_publish_topic: document.getElementById('mqttPublishTopic').value
             };
             await fetch('/config/mqtt', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(settings)});
             alert('MQTT settings saved!');
@@ -674,6 +820,46 @@ const char index_html[] PROGMEM = R"rawliteral(
             const response = await fetch(`/testmqtt?server=${server}&port=${port}`);
             const result = await response.text();
             document.getElementById('mqttTestResult').innerHTML = result;
+        }
+        
+        async function sendTestMessage() {
+            let topic = document.getElementById('testTopic').value.trim();
+            const publishTopic = document.getElementById('mqttPublishTopic').value;
+            const message = document.getElementById('testMessage').value;
+            
+            if (!topic) {
+                topic = publishTopic;
+            }
+            
+            if (!topic) {
+                alert('Please enter a topic or configure publish topic in settings');
+                return;
+            }
+            
+            if (!message) {
+                alert('Please enter a message to send');
+                return;
+            }
+            
+            try {
+                const response = await fetch('/mqtt/send', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({topic: topic, message: message})
+                });
+                const result = await response.text();
+                document.getElementById('mqttTestResult').innerHTML = result;
+                setTimeout(() => {
+                    document.getElementById('mqttTestResult').innerHTML = '';
+                }, 5000);
+            } catch(e) {
+                alert('Failed to send message');
+            }
+        }
+        
+        function clearPayloadDisplay() {
+            document.getElementById('lastMqttPayload').innerHTML = 'No messages received yet';
+            document.getElementById('lastMqttTopic').innerHTML = '-';
         }
         
         async function saveEspNow() {
@@ -734,6 +920,13 @@ const char index_html[] PROGMEM = R"rawliteral(
             }
         }
         
+        async function rebootNow() {
+            if (confirm('Reboot device?')) {
+                await fetch('/reboot');
+                alert('Rebooting...');
+            }
+        }
+        
         async function resetStats() {
             if (confirm('Reset pump statistics?')) {
                 await fetch('/resetstats');
@@ -778,6 +971,22 @@ const char ap_html[] PROGMEM = R"rawliteral(
             width: 100%;
         }
         h1 { text-align: center; color: #333; }
+        .warning {
+            background: #FEF3C7;
+            color: #92400E;
+            padding: 10px;
+            border-radius: 10px;
+            margin: 10px 0;
+            text-align: center;
+            font-size: 14px;
+        }
+        .countdown {
+            font-size: 24px;
+            font-weight: bold;
+            text-align: center;
+            color: #F59E0B;
+            margin: 10px 0;
+        }
         input {
             width: 100%;
             padding: 12px;
@@ -806,7 +1015,11 @@ const char ap_html[] PROGMEM = R"rawliteral(
 <body>
     <div class="container">
         <h1>💧 Smart Pump Controller</h1>
-        <p>WiFi Configuration</p>
+        <div class="warning">
+            ⚠️ NO WiFi CONFIGURED<br>
+            Device will reboot in <span id="countdown" class="countdown">10:00</span> to retry
+        </div>
+        <p>Please configure your WiFi network:</p>
         <form action="/connect" method="POST">
             <input type="text" name="ssid" placeholder="WiFi SSID" required>
             <input type="password" name="password" placeholder="WiFi Password">
@@ -818,6 +1031,21 @@ const char ap_html[] PROGMEM = R"rawliteral(
         </div>
     </div>
     <script>
+        let remainingSeconds = 600;
+        
+        function updateCountdown() {
+            const minutes = Math.floor(remainingSeconds / 60);
+            const seconds = remainingSeconds % 60;
+            document.getElementById('countdown').innerText = `${minutes.toString().padStart(2,'0')}:${seconds.toString().padStart(2,'0')}`;
+            
+            if (remainingSeconds <= 0) {
+                document.getElementById('countdown').innerText = "Rebooting...";
+            }
+            remainingSeconds--;
+        }
+        
+        setInterval(updateCountdown, 1000);
+        
         async function scanNetworks() {
             const response = await fetch('/scan');
             const networks = await response.json();
@@ -873,6 +1101,8 @@ void loadConfig() {
       Config defaultConfig;
       config = defaultConfig;
       DEBUG_PRINTLN("Using factory defaults");
+      // Set default publish topic
+      strcpy(config.mqtt_publish_topic, "TankMonitor888/command");
     }
     
     saveConfig();
@@ -888,6 +1118,9 @@ void loadConfig() {
     config.high_threshold = 80.0;
   }
   if (config.espnow_channel < 1 || config.espnow_channel > 13) config.espnow_channel = 1;
+  if (strlen(config.mqtt_publish_topic) == 0) {
+    strcpy(config.mqtt_publish_topic, "TankMonitor888/command");
+  }
 }
 
 void factoryReset() {
@@ -906,17 +1139,10 @@ void factoryReset() {
   ESP.restart();
 }
 
-void dumpEEPROM() {
-  DEBUG_PRINTLN("\n=== EEPROM Dump ===");
-  EEPROM.begin(512);
-  for (int i = 0; i < sizeof(Config); i++) {
-    byte val = EEPROM.read(i);
-    if (i % 16 == 0) DEBUG_PRINT("\n0x" + String(i, HEX) + ": ");
-    DEBUG_PRINT(String(val, HEX) + " ");
-    if ((i + 1) % 16 == 0) DEBUG_PRINT(" ");
-  }
-  DEBUG_PRINTLN("\n==================\n");
-  EEPROM.end();
+void rebootDevice() {
+  DEBUG_PRINTLN("Rebooting device...");
+  delay(500);
+  ESP.restart();
 }
 
 // ========== Helper Functions ==========
@@ -938,6 +1164,55 @@ bool stringToMac(const String& macStr, uint8_t* mac) {
   return false;
 }
 
+// ========== WiFi Connection ==========
+bool connectToWiFi() {
+  if (strlen(config.ssid) == 0) {
+    DEBUG_PRINTLN("No SSID configured");
+    return false;
+  }
+  
+  DEBUG_PRINT("Connecting to WiFi: ");
+  DEBUG_PRINTLN(config.ssid);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(config.ssid, config.password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < MAX_WIFI_ATTEMPTS) {
+    delay(500);
+    attempts++;
+    DEBUG_PRINT(".");
+  }
+  DEBUG_PRINTLN();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    DEBUG_PRINTLN("WiFi connected!");
+    DEBUG_PRINT("IP: ");
+    DEBUG_PRINTLN(WiFi.localIP());
+    return true;
+  } else {
+    DEBUG_PRINTLN("WiFi connection failed!");
+    return false;
+  }
+}
+
+void checkAPModeTimeout() {
+  if (apMode && (millis() - apModeStartTime) >= AP_MODE_TIMEOUT) {
+    DEBUG_PRINTLN("AP Mode timeout reached (10 minutes), rebooting to search for WiFi...");
+    rebootDevice();
+  }
+}
+
+void setupAPMode() {
+  apMode = true;
+  apModeStartTime = millis();
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(apSSID.c_str(), "12345678");
+  DEBUG_PRINTLN("AP Mode active: " + apSSID);
+  DEBUG_PRINTLN("AP IP: 192.168.4.1");
+  DEBUG_PRINTLN("Will timeout and reboot in 10 minutes");
+}
+
 // ========== ESP-NOW Functions ==========
 void OnDataRecv(uint8_t *mac, uint8_t *incomingData, uint8_t len) {
   if (len == sizeof(SensorData)) {
@@ -946,7 +1221,7 @@ void OnDataRecv(uint8_t *mac, uint8_t *incomingData, uint8_t len) {
     currentWaterLevel = data.level_percent;
     currentDistance = data.distance_cm;
     currentVolume = data.volume_liters;
-    waterSource = String(data.device_id);
+    sensorDeviceId = String(data.device_id);
     lastEspNowData = millis();
     mqttDataValid = true;
     DEBUG_PRINTLN("ESP-NOW: Level=" + String(currentWaterLevel, 1) + "%");
@@ -974,15 +1249,90 @@ void initEspNow() {
 }
 
 // ========== MQTT Functions ==========
+void publishTestMessage(String topic, String message) {
+  if (!mqtt.connected()) {
+    DEBUG_PRINTLN("MQTT not connected, cannot send test message");
+    return;
+  }
+  
+  if (mqtt.publish(topic.c_str(), message.c_str())) {
+    DEBUG_PRINTLN("Test message sent to topic: " + topic);
+    DEBUG_PRINTLN("Message: " + message);
+  } else {
+    DEBUG_PRINTLN("Failed to send test message");
+  }
+}
+
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  StaticJsonDocument<512> doc;
-  deserializeJson(doc, payload, length);
-  if (doc.containsKey("level_percent")) currentWaterLevel = doc["level_percent"];
-  if (doc.containsKey("distance_cm")) currentDistance = doc["distance_cm"];
-  if (doc.containsKey("volume_liters")) currentVolume = doc["volume_liters"];
+  // Store the topic
+  lastMqttTopic = String(topic);
+  
+  // Convert payload to string and store
+  char message[length + 1];
+  memcpy(message, payload, length);
+  message[length] = '\0';
+  lastMqttPayload = String(message);
+  
+  DEBUG_PRINTLN("MQTT Message received on topic: " + lastMqttTopic);
+  DEBUG_PRINTLN("Full Payload: " + lastMqttPayload);
+  
+  // Parse JSON payload
+  StaticJsonDocument<1024> doc;
+  DeserializationError error = deserializeJson(doc, payload, length);
+  
+  if (error) {
+    DEBUG_PRINTLN("MQTT JSON parse failed: " + String(error.c_str()));
+    return;
+  }
+  
+  // Extract water level data from payload
+  if (doc.containsKey("level_percent")) {
+    currentWaterLevel = doc["level_percent"];
+    DEBUG_PRINTLN("Water Level: " + String(currentWaterLevel, 1) + "%");
+  }
+  
+  if (doc.containsKey("distance_cm")) {
+    currentDistance = doc["distance_cm"];
+    DEBUG_PRINTLN("Distance: " + String(currentDistance, 1) + "cm");
+  }
+  
+  if (doc.containsKey("volume_liters")) {
+    currentVolume = doc["volume_liters"];
+    DEBUG_PRINTLN("Volume: " + String(currentVolume, 1) + "L");
+  }
+  
+  if (doc.containsKey("battery_voltage")) {
+    batteryVoltage = doc["battery_voltage"];
+  }
+  
+  if (doc.containsKey("battery_percentage")) {
+    batteryPercentage = doc["battery_percentage"];
+  }
+  
+  if (doc.containsKey("battery_status")) {
+    batteryStatus = doc["battery_status"].as<String>();
+  }
+  
+  if (doc.containsKey("device")) {
+    sensorDeviceId = doc["device"].as<String>();
+  }
+  
+  if (doc.containsKey("ip_address")) {
+    sensorIpAddress = doc["ip_address"].as<String>();
+  }
+  
+  if (doc.containsKey("timestamp")) {
+    sensorTimestamp = doc["timestamp"].as<String>();
+  }
+  
+  if (doc.containsKey("next_online")) {
+    sensorNextOnline = doc["next_online"].as<String>();
+  }
+  
   lastMqttData = millis();
   mqttDataValid = true;
-  DEBUG_PRINTLN("MQTT: Level=" + String(currentWaterLevel, 1) + "%");
+  
+  DEBUG_PRINTLN("--- Sensor Data Updated ---");
 }
 
 void reconnectMQTT() {
@@ -990,33 +1340,18 @@ void reconnectMQTT() {
   if (millis() - lastMqttAttempt < MQTT_RECONNECT_INTERVAL) return;
   lastMqttAttempt = millis();
   
+  DEBUG_PRINT("Attempting MQTT connection...");
+  
   if (mqtt.connect(deviceName.c_str())) {
-    DEBUG_PRINTLN("MQTT Connected");
-    mqtt.subscribe(config.mqtt_topic);
+    DEBUG_PRINTLN("connected!");
+    if (mqtt.subscribe(config.mqtt_topic)) {
+      DEBUG_PRINTLN("Subscribed to: " + String(config.mqtt_topic));
+    } else {
+      DEBUG_PRINTLN("Subscribe failed!");
+    }
   } else {
-    DEBUG_PRINTLN("MQTT Failed: " + String(mqtt.state()));
+    DEBUG_PRINTLN("failed, state=" + String(mqtt.state()));
   }
-}
-
-void publishData() {
-  if (!mqtt.connected() || apMode) return;
-  if (millis() - lastMqttPublish < DATA_PUBLISH_INTERVAL) return;
-  lastMqttPublish = millis();
-  
-  StaticJsonDocument<512> doc;
-  doc["water_level"] = currentWaterLevel;
-  doc["distance_cm"] = currentDistance;
-  doc["volume_l"] = currentVolume;
-  doc["pump_state"] = s31.getRelayState();
-  doc["power_w"] = s31.getPower();
-  doc["voltage_v"] = s31.getVoltage();
-  doc["current_a"] = s31.getCurrent();
-  doc["energy_kwh"] = s31.getEnergy();
-  doc["auto_mode"] = config.auto_mode;
-  
-  char buffer[512];
-  serializeJson(doc, buffer);
-  mqtt.publish(config.mqtt_topic, buffer);
 }
 
 // ========== Pump Control ==========
@@ -1041,14 +1376,12 @@ void controlPump() {
     shouldPumpOn = currentState;
   }
   
-  // Update statistics
   if (currentState && !pumpStats.wasRunning) {
     pumpStats.pumpCycles++;
     pumpStats.lastPumpOnTime = millis();
     pumpStats.wasRunning = true;
-    // Update energy statistics based on power
     pumpStats.totalEnergyKwh = s31.getEnergy();
-    DEBUG_PRINTLN("Pump ON (Level: " + String(currentWaterLevel, 1) + "%)");
+    DEBUG_PRINTLN("Pump ON");
   } else if (!currentState && pumpStats.wasRunning) {
     unsigned long runtime = (millis() - pumpStats.lastPumpOnTime) / 1000;
     pumpStats.totalRuntimeSeconds += runtime;
@@ -1056,7 +1389,6 @@ void controlPump() {
     DEBUG_PRINTLN("Pump OFF (Ran for " + String(runtime) + "s)");
   }
   
-  // Control pump
   if (shouldPumpOn && !currentState) {
     s31.setRelay(true);
   } else if (!shouldPumpOn && currentState) {
@@ -1072,7 +1404,7 @@ void setupWebServer() {
   });
   
   server.on("/data", HTTP_GET, []() {
-    StaticJsonDocument<768> doc;
+    StaticJsonDocument<1536> doc;
     doc["waterLevel"] = currentWaterLevel;
     doc["distance"] = currentDistance;
     doc["volume"] = currentVolume;
@@ -1082,12 +1414,34 @@ void setupWebServer() {
     doc["energy"] = s31.getEnergy();
     doc["pumpState"] = s31.getRelayState();
     doc["autoMode"] = config.auto_mode;
+    doc["wifiConnected"] = (WiFi.status() == WL_CONNECTED);
     doc["mqttConnected"] = mqtt.connected();
     doc["espnowActive"] = espnow_initialized;
+    doc["apModeActive"] = apMode;
+    doc["hostname"] = deviceName;
+    doc["ip"] = apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+    doc["lastMqttTopic"] = lastMqttTopic;
+    doc["lastMqttPayload"] = lastMqttPayload;
+    
+    JsonObject sensorInfo = doc.createNestedObject("sensorInfo");
+    sensorInfo["available"] = mqttDataValid;
+    sensorInfo["device"] = sensorDeviceId;
+    sensorInfo["ip"] = sensorIpAddress;
+    sensorInfo["battery_percentage"] = batteryPercentage;
+    sensorInfo["battery_status"] = batteryStatus;
+    sensorInfo["battery_voltage"] = batteryVoltage;
+    sensorInfo["timestamp"] = sensorTimestamp;
+    sensorInfo["next_online"] = sensorNextOnline;
+    sensorInfo["uptime"] = sensorUptime;
+    
+    if (apMode) {
+      unsigned long elapsed = millis() - apModeStartTime;
+      unsigned long remaining = (AP_MODE_TIMEOUT > elapsed) ? (AP_MODE_TIMEOUT - elapsed) / 1000 : 0;
+      doc["apTimeRemaining"] = remaining;
+    }
+    
     doc["dataSource"] = (espnow_initialized && millis() - lastEspNowData < 30000) ? "ESP-NOW" : 
                         (mqttDataValid && millis() - lastMqttData < 300000) ? "MQTT" : "No Data";
-    doc["hostname"] = deviceName;
-    doc["ip"] = WiFi.localIP().toString();
     
     String reason = "";
     if (!config.auto_mode) reason = "Manual Control";
@@ -1107,6 +1461,7 @@ void setupWebServer() {
     doc["mqtt_server"] = config.mqtt_server;
     doc["mqtt_port"] = config.mqtt_port;
     doc["mqtt_topic"] = config.mqtt_topic;
+    doc["mqtt_publish_topic"] = config.mqtt_publish_topic;
     doc["low_threshold"] = config.low_threshold;
     doc["high_threshold"] = config.high_threshold;
     doc["min_power"] = config.min_power_threshold;
@@ -1123,10 +1478,11 @@ void setupWebServer() {
   
   server.on("/config/wifi", HTTP_POST, []() {
     if (server.hasArg("plain")) {
-      StaticJsonDocument<256> doc;
+      StaticJsonDocument<512> doc;
       deserializeJson(doc, server.arg("plain"));
       if (doc.containsKey("wifi_ssid")) strcpy(config.ssid, doc["wifi_ssid"]);
       if (doc.containsKey("wifi_password")) strcpy(config.password, doc["wifi_password"]);
+      if (doc.containsKey("hostname")) deviceName = doc["hostname"].as<String>();
       saveConfig();
       server.send(200, "text/plain", "OK");
       delay(1000);
@@ -1136,11 +1492,12 @@ void setupWebServer() {
   
   server.on("/config/mqtt", HTTP_POST, []() {
     if (server.hasArg("plain")) {
-      StaticJsonDocument<256> doc;
+      StaticJsonDocument<512> doc;
       deserializeJson(doc, server.arg("plain"));
       if (doc.containsKey("mqtt_server")) strcpy(config.mqtt_server, doc["mqtt_server"]);
       if (doc.containsKey("mqtt_port")) config.mqtt_port = doc["mqtt_port"];
       if (doc.containsKey("mqtt_topic")) strcpy(config.mqtt_topic, doc["mqtt_topic"]);
+      if (doc.containsKey("mqtt_publish_topic")) strcpy(config.mqtt_publish_topic, doc["mqtt_publish_topic"]);
       saveConfig();
       server.send(200, "text/plain", "OK");
       delay(500);
@@ -1148,9 +1505,28 @@ void setupWebServer() {
     }
   });
   
+  // New endpoint for sending test MQTT messages
+  server.on("/mqtt/send", HTTP_POST, []() {
+    if (server.hasArg("plain")) {
+      StaticJsonDocument<512> doc;
+      deserializeJson(doc, server.arg("plain"));
+      String topic = doc["topic"].as<String>();
+      String message = doc["message"].as<String>();
+      
+      if (topic.length() > 0 && message.length() > 0) {
+        publishTestMessage(topic, message);
+        server.send(200, "text/plain", "✅ Message sent to topic: " + topic);
+      } else {
+        server.send(400, "text/plain", "❌ Topic and message required");
+      }
+    } else {
+      server.send(400, "text/plain", "❌ Invalid request");
+    }
+  });
+  
   server.on("/config/espnow", HTTP_POST, []() {
     if (server.hasArg("plain")) {
-      StaticJsonDocument<256> doc;
+      StaticJsonDocument<512> doc;
       deserializeJson(doc, server.arg("plain"));
       if (doc.containsKey("use_espnow")) config.use_espnow = doc["use_espnow"];
       if (doc.containsKey("peer_mac")) {
@@ -1168,7 +1544,7 @@ void setupWebServer() {
   
   server.on("/config/pump", HTTP_POST, []() {
     if (server.hasArg("plain")) {
-      StaticJsonDocument<256> doc;
+      StaticJsonDocument<512> doc;
       deserializeJson(doc, server.arg("plain"));
       if (doc.containsKey("low_threshold")) config.low_threshold = doc["low_threshold"];
       if (doc.containsKey("high_threshold")) config.high_threshold = doc["high_threshold"];
@@ -1194,7 +1570,7 @@ void setupWebServer() {
   });
   
   server.on("/stats", HTTP_GET, []() {
-    StaticJsonDocument<256> doc;
+    StaticJsonDocument<512> doc;
     doc["total_runtime"] = pumpStats.totalRuntimeSeconds / 60;
     doc["total_energy"] = pumpStats.totalEnergyKwh;
     doc["pump_cycles"] = pumpStats.pumpCycles;
@@ -1236,6 +1612,12 @@ void setupWebServer() {
     factoryReset();
   });
   
+  server.on("/reboot", HTTP_GET, []() {
+    server.send(200, "text/plain", "Rebooting...");
+    delay(100);
+    rebootDevice();
+  });
+  
   server.on("/scan", HTTP_GET, []() {
     int n = WiFi.scanComplete();
     if (n == -2) {
@@ -1273,7 +1655,7 @@ void setupWebServer() {
     PubSubClient testMqtt(testClient);
     testMqtt.setServer(config.mqtt_server, config.mqtt_port);
     if (testMqtt.connect("testclient")) {
-      server.send(200, "text/plain", "✅ MQTT connection successful!");
+      server.send(200, "text/plain", "✅ MQTT connection successful! Device will subscribe to: " + String(config.mqtt_topic));
       testMqtt.disconnect();
     } else {
       server.send(200, "text/plain", "❌ MQTT connection failed: " + String(testMqtt.state()));
@@ -1281,7 +1663,8 @@ void setupWebServer() {
   });
   
   server.on("/info", HTTP_GET, []() {
-    String json = "{\"mac\":\"" + WiFi.macAddress() + "\",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
+    String json = "{\"mac\":\"" + WiFi.macAddress() + "\",\"ip\":\"" + 
+                  (apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) + "\"}";
     server.send(200, "application/json", json);
   });
   
@@ -1297,118 +1680,98 @@ void setupWebServer() {
   });
 }
 
-void setupAPMode() {
-  apMode = true;
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(apSSID.c_str(), "12345678");
-  DEBUG_PRINTLN("AP Mode: " + apSSID);
-}
-
 // ========== Main Setup ==========
 void setup() {
   #if DEBUG
     Serial.begin(115200);
     delay(100);
-    DEBUG_PRINTLN("\n=== Smart Pump Controller v2.5.1 ===");
+    DEBUG_PRINTLN("\n=== Smart Pump Controller v2.8.0 (MQTT Test Publisher) ===");
   #endif
   
-  // Initialize EEPROM and load config
   loadConfig();
   
   #if DEBUG
     dumpEEPROM();
   #endif
   
-  // Initialize hardware
   uint32_t chipId = ESP.getChipId();
   deviceName = "s31-pump-" + String(chipId & 0xFFFF, HEX);
   apSSID = "SmartPump-" + String(chipId & 0xFFFF, HEX);
   
-  // Initialize SonoffS31 library
   s31.begin();
   
-  // Connect to WiFi or start AP
   if (strlen(config.ssid) > 0) {
     WiFi.hostname(deviceName);
-    WiFi.begin(config.ssid, config.password);
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-      delay(500);
-      attempts++;
-      DEBUG_PRINT(".");
+    if (connectToWiFi()) {
+      DEBUG_PRINTLN("WiFi Connected: " + WiFi.localIP().toString());
+      mqtt.setServer(config.mqtt_server, config.mqtt_port);
+      mqtt.setCallback(mqttCallback);
+      initEspNow();
+    } else {
+      DEBUG_PRINTLN("Failed to connect to WiFi, entering AP mode");
+      setupAPMode();
     }
-    DEBUG_PRINTLN();
-  }
-  
-  if (WiFi.status() != WL_CONNECTED) {
-    setupAPMode();
   } else {
-    DEBUG_PRINTLN("WiFi Connected: " + WiFi.localIP().toString());
-    mqtt.setServer(config.mqtt_server, config.mqtt_port);
-    mqtt.setCallback(mqttCallback);
-    initEspNow();
+    DEBUG_PRINTLN("No SSID configured, entering AP mode");
+    setupAPMode();
   }
   
   setupWebServer();
   ArduinoOTA.begin();
-  MDNS.begin(deviceName.c_str());
+  if (!apMode) {
+    MDNS.begin(deviceName.c_str());
+  }
   server.begin();
   
   DEBUG_PRINTLN("Setup complete - " + deviceName);
+  DEBUG_PRINTLN("MQTT Subscribe Topic: " + String(config.mqtt_topic));
+  DEBUG_PRINTLN("MQTT Publish Topic: " + String(config.mqtt_publish_topic));
   DEBUG_PRINTLN("===============================\n");
 }
 
-// ========== Non-blocking Main Loop ==========
+// ========== Main Loop ==========
 void loop() {
   unsigned long currentMillis = millis();
   
-  // HIGHEST PRIORITY: s31.update() - Run every 100ms
   if (currentMillis - lastS31Update >= S31_UPDATE_INTERVAL) {
     lastS31Update = currentMillis;
     s31.update();
   }
   
-  // Run other tasks with time limits to ensure s31.update priority
   unsigned long startTime = micros();
   
-  // Web server (max 10ms per loop)
   if (currentMillis - lastWebServer >= WEB_SERVER_INTERVAL) {
     lastWebServer = currentMillis;
     server.handleClient();
   }
   if (micros() - startTime > AQUIRE_TIMEOUT) return;
   
-  // OTA updates (max 10ms per loop)
   if (currentMillis - lastOTA >= OTA_INTERVAL) {
     lastOTA = currentMillis;
     ArduinoOTA.handle();
   }
   if (micros() - startTime > AQUIRE_TIMEOUT) return;
   
-  // Non-AP mode tasks
-  if (!apMode) {
-    // MQTT (max 5ms per loop)
-    if (WiFi.status() == WL_CONNECTED) {
-      if (!mqtt.connected()) {
-        reconnectMQTT();
-      } else {
-        mqtt.loop();
-        publishData();
-      }
+  checkAPModeTimeout();
+  
+  if (!apMode && WiFi.status() == WL_CONNECTED) {
+    if (!mqtt.connected()) {
+      reconnectMQTT();
+    } else {
+      mqtt.loop();
     }
     if (micros() - startTime > AQUIRE_TIMEOUT) return;
     
-    // Pump control (max 2ms per loop)
     controlPump();
     if (micros() - startTime > AQUIRE_TIMEOUT) return;
+    
+    if (currentMillis - lastMDNS >= MDNS_INTERVAL) {
+      lastMDNS = currentMillis;
+      MDNS.update();
+    }
+  } else if (apMode) {
+    controlPump();
   }
   
-  // MDNS update (every second)
-  if (currentMillis - lastMDNS >= MDNS_INTERVAL) {
-    lastMDNS = currentMillis;
-    MDNS.update();
-  }
-  
-  // Small delay to prevent watchdog timeout
   delay(1);
 }
