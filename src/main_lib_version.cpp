@@ -1,19 +1,3 @@
-/*
- * Sonoff S31 Web Dashboard
- * Using SonoffS31 library for CSE7766 power monitoring and relay control
- * 
- * Features:
- * - Real-time power monitoring using CSE7766
- * - Web dashboard with responsive design
- * - Relay control via web interface
- * - mDNS support (http://s31-xxxx.local)
- * - OTA updates
- * 
- * Author: Komkrit Chooraung
- * Date: 2025-12-21
- * Version: 1.0.0
- */
-
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
@@ -24,17 +8,16 @@
 const char* ssid = "redmi4xx";
 const char* password = "komkritc";
 
-// Create SonoffS31 instance
-// Parameters: RX pin (for CSE7766), Relay pin
-SonoffS31 s31(3, 12);
+// Device name
+String deviceName = "s31";
+
+// Create SonoffS31 instance (relay on GPIO12)
+SonoffS31 s31(12);
 
 // Web Server
 ESP8266WebServer server(80);
 
-// Device name
-String deviceName = "s31";
-
-// HTML Dashboard
+// HTML Dashboard (same as before)
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -199,21 +182,6 @@ const char index_html[] PROGMEM = R"rawliteral(
             text-align: center;
         }
         
-        button.action {
-            background: #667eea;
-            color: white;
-            border: none;
-            padding: 5px 10px;
-            border-radius: 5px;
-            font-size: 10px;
-            cursor: pointer;
-            margin-top: 10px;
-        }
-        
-        button.action:hover {
-            background: #5a67d8;
-        }
-        
         @media (max-width: 480px) {
             .power-value { font-size: 36px; }
             .stat-value { font-size: 18px; }
@@ -224,7 +192,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 <body>
     <div class="container">
         <div class="card">
-            <h1>⚡ Sonoff S31</h1>
+            <h1>Sonoff S31 v1.0</h1>
             <div class="subtitle" id="deviceId">Loading...</div>
             
             <div class="power-display">
@@ -248,15 +216,15 @@ const char index_html[] PROGMEM = R"rawliteral(
                     </div>
                 </div>
                 <div class="stat">
-                    <div class="stat-label">Power Factor</div>
-                    <div class="stat-value">
-                        <span id="pf">0</span>
-                    </div>
-                </div>
-                <div class="stat">
                     <div class="stat-label">Energy</div>
                     <div class="stat-value">
                         <span id="energy">0</span><span class="stat-unit">kWh</span>
+                    </div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">Relay</div>
+                    <div class="stat-value">
+                        <span id="relayStatus">OFF</span>
                     </div>
                 </div>
             </div>
@@ -264,10 +232,6 @@ const char index_html[] PROGMEM = R"rawliteral(
             <button class="relay-btn off" id="relayBtn" onclick="toggleRelay()">
                 <span id="relayText">OFF</span>
             </button>
-            
-            <div style="text-align: center; margin-top: 10px;">
-                <button class="action" onclick="resetEnergy()">Reset Energy</button>
-            </div>
             
             <div class="info">
                 <div><span class="status" id="statusLed"></span> <span id="statusText">Updating...</span></div>
@@ -284,8 +248,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 
                 document.getElementById('power').innerText = data.power.toFixed(1);
                 document.getElementById('voltage').innerText = data.voltage.toFixed(1);
-                document.getElementById('current').innerText = data.current.toFixed(2);
-                document.getElementById('pf').innerText = data.powerFactor.toFixed(2);
+                document.getElementById('current').innerText = data.current.toFixed(3);
                 document.getElementById('energy').innerText = data.energy.toFixed(3);
                 
                 const relayStatus = document.getElementById('relayStatus');
@@ -322,26 +285,15 @@ const char index_html[] PROGMEM = R"rawliteral(
             }
         }
         
-        async function resetEnergy() {
-            if (confirm('Reset energy counter?')) {
-                try {
-                    await fetch('/reset');
-                    setTimeout(fetchData, 100);
-                } catch(e) {
-                    console.error('Reset error:', e);
-                }
-            }
-        }
-        
         async function getDeviceInfo() {
             try {
                 const res = await fetch('/info');
                 const info = await res.json();
-                document.getElementById('deviceId').innerHTML = info.hostname + '.local | ' + info.ip;
+                document.getElementById('deviceId').innerHTML = info.hostname + '.local';
             } catch(e) {}
         }
         
-        setInterval(fetchData, 1500);
+        setInterval(fetchData, 1000);
         setInterval(getDeviceInfo, 30000);
         
         fetchData();
@@ -352,98 +304,91 @@ const char index_html[] PROGMEM = R"rawliteral(
 )rawliteral";
 
 void setup() {
-    // Initialize Serial for debugging (optional)
-    Serial.begin(115200);
-    
-    // Initialize Sonoff S31 library
-    s31.begin(4800);
-    
-    // Generate unique hostname
-    uint32_t chipId = ESP.getChipId();
-    deviceName = "s31-" + String(chipId & 0xFFFF, HEX);
-    deviceName.toLowerCase();
-    
-    // Connect to WiFi
-    WiFi.hostname(deviceName);
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, password);
-    
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-    }
-    
-    // Setup mDNS
-    MDNS.begin(deviceName.c_str());
-    MDNS.addService("http", "tcp", 80);
-    
-    // Setup OTA
-    ArduinoOTA.setHostname(deviceName.c_str());
-    ArduinoOTA.setPassword("admin123");
-    ArduinoOTA.begin();
-    
-    // Web server routes
-    server.on("/", HTTP_GET, []() {
-        server.send_P(200, "text/html", index_html);
-    });
-    
-    server.on("/data", HTTP_GET, []() {
-        s31.update();
-        PowerData data = s31.getPowerData();
-        
-        String json = "{";
-        json += "\"voltage\":" + String(data.voltage, 1) + ",";
-        json += "\"current\":" + String(data.current, 3) + ",";
-        json += "\"power\":" + String(data.power, 1) + ",";
-        json += "\"apparentPower\":" + String(data.apparentPower, 1) + ",";
-        json += "\"powerFactor\":" + String(data.powerFactor, 2) + ",";
-        json += "\"energy\":" + String(data.energy, 3) + ",";
-        json += "\"relayState\":" + String(data.relayState ? "true" : "false") + ",";
-        json += "\"isValid\":" + String(data.isValid ? "true" : "false");
-        json += "}";
-        server.send(200, "application/json", json);
-    });
-    
-    server.on("/toggle", HTTP_GET, []() {
-        s31.relayToggle();
-        server.send(200, "text/plain", "OK");
-    });
-    
-    server.on("/on", HTTP_GET, []() {
-        s31.relayOn();
-        server.send(200, "text/plain", "ON");
-    });
-    
-    server.on("/off", HTTP_GET, []() {
-        s31.relayOff();
-        server.send(200, "text/plain", "OFF");
-    });
-    
-    server.on("/reset", HTTP_GET, []() {
-        s31.resetEnergy();
-        server.send(200, "text/plain", "OK");
-    });
-    
-    server.on("/info", HTTP_GET, []() {
-        String json = "{";
-        json += "\"hostname\":\"" + deviceName + "\",";
-        json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
-        json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
-        json += "\"freeHeap\":" + String(ESP.getFreeHeap());
-        json += "}";
-        server.send(200, "application/json", json);
-    });
-    
-    server.begin();
+  Serial.begin(115200);  // For debugging
+  
+  // Initialize the S31 library
+  s31.begin();
+  
+  // Optional: Set callbacks for debugging
+  s31.onPowerUpdate([](float power, float voltage, float current) {
+    // Optional: Log power updates
+    // Serial.printf("Power: %.1fW, Voltage: %.1fV, Current: %.3fA\n", power, voltage, current);
+  });
+  
+  s31.onRelayChange([](bool state) {
+    Serial.printf("Relay changed to: %s\n", state ? "ON" : "OFF");
+  });
+  
+  // Connect to WiFi
+  WiFi.hostname(deviceName);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected!");
+  
+  // Setup mDNS
+  MDNS.begin(deviceName.c_str());
+  MDNS.addService("http", "tcp", 80);
+  
+  // Setup OTA
+  ArduinoOTA.setHostname(deviceName.c_str());
+  ArduinoOTA.setPassword("admin123");
+  ArduinoOTA.begin();
+  
+  // Web server routes
+  server.on("/", HTTP_GET, []() {
+    server.send_P(200, "text/html", index_html);
+  });
+  
+  server.on("/data", HTTP_GET, []() {
+    String json = "{";
+    json += "\"voltage\":" + String(s31.getVoltage(), 1) + ",";
+    json += "\"current\":" + String(s31.getCurrent(), 3) + ",";
+    json += "\"power\":" + String(s31.getPower(), 1) + ",";
+    json += "\"energy\":" + String(s31.getEnergy(), 3) + ",";
+    json += "\"relayState\":" + String(s31.getRelayState() ? "true" : "false");
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+  
+  server.on("/toggle", HTTP_GET, []() {
+    s31.toggleRelay();
+    server.send(200, "text/plain", "OK");
+  });
+  
+  server.on("/info", HTTP_GET, []() {
+    String json = "{";
+    json += "\"hostname\":\"" + deviceName + "\",";
+    json += "\"ip\":\"" + WiFi.localIP().toString() + "\"";
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+  
+  server.on("/reset", HTTP_GET, []() {
+    s31.resetEnergy();
+    server.send(200, "text/plain", "Energy reset");
+  });
+  
+  server.begin();
+  Serial.println("Web server started");
 }
 
 void loop() {
-    // Update sensor readings
-    s31.update();
-    
-    // Handle OTA and web server
-    ArduinoOTA.handle();
-    MDNS.update();
-    server.handleClient();
-    
-    delay(10);
+  // Update the S31 library (reads power data)
+  s31.update();
+  
+  // Handle OTA updates
+  ArduinoOTA.handle();
+  
+  // Handle mDNS
+  MDNS.update();
+  
+  // Handle web server
+  server.handleClient();
+  
+  delay(5);
 }
